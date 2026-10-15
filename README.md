@@ -185,6 +185,7 @@ Details per phase are in [DESIGN.md](DESIGN.md#roadmap).
 | [DESIGN.md](DESIGN.md) | Goals, how GitOps works here, environments, resource budget, what changes in a real setup, the phases |
 | [RUNBOOK.md](RUNBOOK.md) | Troubleshooting the local platform, with exact commands |
 | [docs/DECISIONS.md](docs/DECISIONS.md) | Numbered decisions: question, decision, why |
+| [docs/EVIDENCE.md](docs/EVIDENCE.md) | Real runs: CI on GitHub and the laptop, with timings and results |
 
 ## Verification status
 
@@ -198,7 +199,7 @@ Measured on 2026-10-15 on a Windows 11 laptop with 16 GB of RAM and Docker Deskt
 | kind node memory | 2.27 GiB used of 7.6 GiB |
 | CPU requests on the node | 3790m in total (boutique-dev 1270m, boutique-prod 1570m, kube-system 950m; Argo CD sets none). That fits the 4 vCPUs of a GitHub-hosted runner with 210m to spare |
 | Lint and tests | PSScriptAnalyzer: 0 findings. Pester: 79/79 |
-| Not yet verified | Argo CD syncing from GitHub (the repository is not pushed yet) and the CI run. Both go in `docs/EVIDENCE.md` after the first push |
+| From GitHub | Argo CD on the laptop synced all three Applications from GitHub at `dc0b135`. The first CI run passed: `validate` in 35 s, then `e2e` built the whole platform on a fresh runner in 195 s. Details are in [docs/EVIDENCE.md](docs/EVIDENCE.md) |
 
 ## Credits
 
