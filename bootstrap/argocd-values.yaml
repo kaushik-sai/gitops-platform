@@ -1,0 +1,19 @@
+# Argo CD for the local cluster: Helm chart argo-cd 10.10.3 (Argo CD v3.5.5), installed by Start-Platform.ps1.
+# The UI is reached with kubectl port-forward on 127.0.0.1 only.
+configs:
+  params:
+    # No TLS inside the cluster: the port-forward never leaves the loopback interface.
+    server.insecure: true
+  cm:
+    # Read-only UI without a login; changes go through Git (DECISIONS #7).
+    users.anonymous.enabled: "true"
+    # Notice new commits sooner than the chart's 120s default.
+    timeout.reconciliation: 60s
+  rbac:
+    policy.default: role:readonly
+
+# Not needed yet: no SSO and no notifications. Saves memory on the laptop.
+dex:
+  enabled: false
+notifications:
+  enabled: false

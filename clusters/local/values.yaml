@@ -1,0 +1,10 @@
+# Start-Platform.ps1 sets repoURL and targetRevision on the root Application;
+# these defaults are what `helm template` uses on its own.
+repoURL: https://github.com/kaushik-sai/gitops-platform.git
+targetRevision: main
+
+# One Application per environment; each deploys apps/boutique/overlays/<name>
+# into the namespace boutique-<name>.
+environments:
+  - dev
+  - prod

@@ -1,0 +1,25 @@
+# Secrets and local config: never commit
+.env
+.env.*
+*.pem
+*.key
+secrets/
+.secrets/
+kubeconfig
+*.kubeconfig
+
+# Helm
+charts/*.tgz
+clusters/**/charts/
+
+# Pester / analyzer output
+TestResults.xml
+coverage.xml
+
+# Local output
+out/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,11 @@
+# The local cluster. One node keeps Docker Desktop's memory for the workloads (DECISIONS #2).
+# The node image is kind v0.33.0's default (Kubernetes 1.37.0), pinned by digest.
+# The cluster name comes from Start-Platform.ps1 (-ClusterName), not from this file.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+networking:
+  # The API server listens on loopback only.
+  apiServerAddress: "127.0.0.1"

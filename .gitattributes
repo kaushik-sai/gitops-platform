@@ -1,0 +1,7 @@
+# Keep line endings stable on Windows so YAML and scripts behave the same in kind, CI and on Linux
+* text=auto eol=lf
+*.ps1 text eol=lf
+*.psm1 text eol=lf
+*.psd1 text eol=lf
+*.png binary
+*.jpg binary

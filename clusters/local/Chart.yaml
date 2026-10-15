@@ -1,0 +1,8 @@
+# The root of the local cluster ("app of apps"). Argo CD renders this chart and applies
+# the Applications it produces. It is a chart, not plain YAML, so that one value,
+# targetRevision, reaches every child Application (DECISIONS #4).
+apiVersion: v2
+name: local-cluster
+description: Argo CD Applications for the local kind cluster
+type: application
+version: 0.1.0

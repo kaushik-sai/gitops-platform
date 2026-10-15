@@ -1,0 +1,308 @@
+# ci: the checks for every pull request and for main, on GitHub-hosted runners.
+#   validate: PSScriptAnalyzer, Pester, and a schema check of every manifest Argo CD applies.
+#   e2e:      the whole platform in a kind cluster. Start-Platform.ps1 installs Argo CD, Argo CD
+#             deploys the commit under test from GitHub, then Online Boutique is smoke-tested in
+#             dev and prod. It runs only when validate passes.
+
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  # Runs on main too, so the README badge shows the state of main.
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Read-only token: nothing here writes to the repository.
+permissions:
+  contents: read
+
+# A new push to a PR cancels the run it replaces; runs on main always finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Pinned tool versions. kind, Helm and kubeconform come from their official releases and
+# must match the SHA-256 each release publishes.
+env:
+  PESTER_VERSION: '5.9.1'
+  SCRIPT_ANALYZER_VERSION: '1.25.0'
+  # The kind release whose default node image bootstrap/kind-config.yaml pins.
+  KIND_VERSION: '0.33.0'
+  HELM_VERSION: '4.3.0'
+  KUBECONFORM_VERSION: '0.8.0'
+  # Manifests are checked against the Kubernetes version that node image runs.
+  KUBERNETES_VERSION: '1.37.0'
+  # Schemas for Argo CD's Application CRD: the CRDs-catalog at a fixed commit.
+  CRDS_CATALOG_SHA: '63669a570e231d4f1f8396d229a1de512bcf0a34'
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  validate:
+    name: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Tools: pinned Pester and PSScriptAnalyzer'
+        run: |
+          # Install the pinned module versions for this user if they are missing.
+          $modules = @{ 'Pester' = $env:PESTER_VERSION; 'PSScriptAnalyzer' = $env:SCRIPT_ANALYZER_VERSION }
+          foreach ($name in $modules.Keys) {
+              $version = $modules[$name]
+              if (-not (Get-Module -ListAvailable -Name $name | Where-Object { $_.Version -eq [version] $version })) {
+                  Write-Output "Installing $name $version"
+                  Install-Module -Name $name -RequiredVersion $version -Scope CurrentUser -Force -SkipPublisherCheck -Repository PSGallery
+              }
+          }
+
+      - name: 'Tools: pinned Helm and kubeconform'
+        run: |
+          # Downloads a release file and the checksum file published with it; stops unless they match.
+          function Save-VerifiedFile {
+              param([string] $Uri, [string] $ChecksumUri, [string] $Path)
+              $name = ([uri] $Uri).Segments[-1]
+              $sums = "$Path.sha256"
+              Invoke-WebRequest -Uri $Uri -OutFile $Path
+              Invoke-WebRequest -Uri $ChecksumUri -OutFile $sums
+              $line = Get-Content -Path $sums | Where-Object { $_ -match "^[0-9a-f]{64}\s+$([regex]::Escape($name))$" } | Select-Object -First 1
+              if (-not $line) { Write-Output "::error::No checksum for $name in $ChecksumUri."; exit 1 }
+              $expected = ($line -split '\s+')[0]
+              $actual = (Get-FileHash -Path $Path -Algorithm SHA256).Hash
+              if ($actual -ne $expected) { Write-Output "::error::Checksum mismatch for $name."; exit 1 }
+          }
+
+          $bin = Join-Path -Path $env:RUNNER_TEMP -ChildPath 'bin'
+          New-Item -ItemType Directory -Path $bin -Force | Out-Null
+
+          $name = "helm-v$($env:HELM_VERSION)-linux-amd64.tar.gz"
+          $archive = Join-Path -Path $env:RUNNER_TEMP -ChildPath $name
+          Save-VerifiedFile -Uri "https://get.helm.sh/$name" -ChecksumUri "https://get.helm.sh/$name.sha256sum" -Path $archive
+          tar -xzf $archive -C $bin --strip-components=1 linux-amd64/helm
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+          $name = 'kubeconform-linux-amd64.tar.gz'
+          $base = "https://github.com/yannh/kubeconform/releases/download/v$($env:KUBECONFORM_VERSION)"
+          $archive = Join-Path -Path $env:RUNNER_TEMP -ChildPath $name
+          Save-VerifiedFile -Uri "$base/$name" -ChecksumUri "$base/CHECKSUMS" -Path $archive
+          tar -xzf $archive -C $bin kubeconform
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+          # The runner image has its own helm; GITHUB_PATH puts these ahead of it for the later steps.
+          Add-Content -Path $env:GITHUB_PATH -Value $bin
+          & (Join-Path -Path $bin -ChildPath 'helm') version
+          & (Join-Path -Path $bin -ChildPath 'kubeconform') -v
+
+      - name: 'Lint: PSScriptAnalyzer'
+        run: |
+          Import-Module PSScriptAnalyzer -RequiredVersion $env:SCRIPT_ANALYZER_VERSION
+          $results = Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
+          $results | Format-Table Severity, RuleName, ScriptName, Line, Message -AutoSize -Wrap | Out-String -Width 200
+          # Information findings are shown but do not fail the build.
+          $blocking = @($results | Where-Object Severity -In 'Error', 'Warning', 'ParseError')
+          if ($blocking.Count -gt 0) {
+              Write-Output "::error::PSScriptAnalyzer: $($blocking.Count) error/warning finding(s)."
+              exit 1
+          }
+          Write-Output 'PSScriptAnalyzer: no errors or warnings.'
+
+      - name: 'Test: Pester'
+        run: |
+          Import-Module Pester -RequiredVersion $env:PESTER_VERSION
+          $config = New-PesterConfiguration
+          $config.Run.Path = './tests'
+          $config.Run.PassThru = $true
+          $config.Output.Verbosity = 'Detailed'
+          $config.TestResult.Enabled = $true
+          $config.TestResult.OutputFormat = 'NUnitXml'
+          $config.TestResult.OutputPath = (Join-Path -Path $env:RUNNER_TEMP -ChildPath 'pester.xml')
+          $result = Invoke-Pester -Configuration $config
+
+          # GitHub has no Tests tab, so the totals and any failures go on the run's summary page.
+          $summary = @(
+              '### Pester'
+              ''
+              '| Result | Passed | Failed | Skipped | Total | Duration |'
+              '|---|---|---|---|---|---|'
+              "| $($result.Result) | $($result.PassedCount) | $($result.FailedCount) | $($result.SkippedCount) | $($result.TotalCount) | $([math]::Round($result.Duration.TotalSeconds))s |"
+          )
+          foreach ($test in $result.Failed) {
+              $summary += "- Failed: $($test.ExpandedPath)"
+          }
+          if ($result.FailedContainersCount -gt 0) {
+              $summary += "- $($result.FailedContainersCount) test file(s) failed to run"
+          }
+          $summary | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+
+          if ($result.Result -ne 'Passed') {
+              Write-Output "::error::Pester: $($result.FailedCount) failed test(s), $($result.FailedContainersCount) test file(s) failed to run."
+              exit 1
+          }
+
+      # Keep the results even when tests failed, so the NUnit file can be downloaded from the run.
+      - name: 'Publish Pester results'
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pester-results
+          path: ${{ runner.temp }}/pester.xml
+          if-no-files-found: ignore
+
+      # Every overlay, rendered the way Argo CD renders it. -strict rejects unknown fields, and a
+      # kind with no schema is an error (no -ignore-missing-schemas), so nothing goes unchecked.
+      - name: 'Manifests: kustomize overlays (kubeconform)'
+        run: |
+          kubectl version --client
+          $overlays = @(Get-ChildItem -Path 'apps/*/overlays/*' -Directory)
+          if ($overlays.Count -eq 0) { Write-Output '::error::No overlays found under apps/*/overlays.'; exit 1 }
+          $failed = @()
+          foreach ($overlay in $overlays) {
+              $path = [System.IO.Path]::GetRelativePath($PWD.Path, $overlay.FullName)
+              Write-Output "--- $path ---"
+              $rendered = kubectl kustomize $path
+              if ($LASTEXITCODE -ne 0) { $failed += $path; continue }
+              $rendered | kubeconform -strict -summary -kubernetes-version $env:KUBERNETES_VERSION -
+              if ($LASTEXITCODE -ne 0) { $failed += $path }
+          }
+          if ($failed.Count -gt 0) {
+              Write-Output "::error::Manifests: $($failed -join ', ') failed kustomize or kubeconform."
+              exit 1
+          }
+
+      # The root chart renders Argo CD Applications. Their schema comes from the CRDs-catalog at the
+      # pinned commit; 'default' still serves the built-in kinds. Missing schemas fail here too.
+      - name: 'Manifests: root chart (helm template, kubeconform)'
+        run: |
+          $crdSchemas = "https://raw.githubusercontent.com/datreeio/CRDs-catalog/$($env:CRDS_CATALOG_SHA)/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json"
+          Write-Output '--- clusters/local ---'
+          $rendered = helm template root clusters/local
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::helm template clusters/local failed.'; exit 1 }
+          $rendered | kubeconform -strict -summary -kubernetes-version $env:KUBERNETES_VERSION -schema-location default -schema-location $crdSchemas -
+          if ($LASTEXITCODE -ne 0) {
+              Write-Output '::error::kubeconform: clusters/local rendered invalid resources or resources with no schema.'
+              exit 1
+          }
+
+  e2e:
+    name: e2e
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Start-Platform.ps1's default cluster is gitops-local; kind names its context kind-<name>.
+      KUBE_CONTEXT: kind-gitops-local
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # kubectl is preinstalled on the runner image; its version is printed for the record.
+      - name: 'Tools: pinned kind and Helm'
+        run: |
+          # Downloads a release file and the checksum file published with it; stops unless they match.
+          function Save-VerifiedFile {
+              param([string] $Uri, [string] $ChecksumUri, [string] $Path)
+              $name = ([uri] $Uri).Segments[-1]
+              $sums = "$Path.sha256"
+              Invoke-WebRequest -Uri $Uri -OutFile $Path
+              Invoke-WebRequest -Uri $ChecksumUri -OutFile $sums
+              $line = Get-Content -Path $sums | Where-Object { $_ -match "^[0-9a-f]{64}\s+$([regex]::Escape($name))$" } | Select-Object -First 1
+              if (-not $line) { Write-Output "::error::No checksum for $name in $ChecksumUri."; exit 1 }
+              $expected = ($line -split '\s+')[0]
+              $actual = (Get-FileHash -Path $Path -Algorithm SHA256).Hash
+              if ($actual -ne $expected) { Write-Output "::error::Checksum mismatch for $name."; exit 1 }
+          }
+
+          $bin = Join-Path -Path $env:RUNNER_TEMP -ChildPath 'bin'
+          New-Item -ItemType Directory -Path $bin -Force | Out-Null
+
+          $name = 'kind-linux-amd64'
+          $base = "https://github.com/kubernetes-sigs/kind/releases/download/v$($env:KIND_VERSION)"
+          $download = Join-Path -Path $env:RUNNER_TEMP -ChildPath $name
+          Save-VerifiedFile -Uri "$base/$name" -ChecksumUri "$base/$name.sha256sum" -Path $download
+          Move-Item -Path $download -Destination (Join-Path -Path $bin -ChildPath 'kind')
+          chmod +x (Join-Path -Path $bin -ChildPath 'kind')
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+          $name = "helm-v$($env:HELM_VERSION)-linux-amd64.tar.gz"
+          $archive = Join-Path -Path $env:RUNNER_TEMP -ChildPath $name
+          Save-VerifiedFile -Uri "https://get.helm.sh/$name" -ChecksumUri "https://get.helm.sh/$name.sha256sum" -Path $archive
+          tar -xzf $archive -C $bin --strip-components=1 linux-amd64/helm
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+          # The runner image has its own kind and helm; GITHUB_PATH puts these ahead of them for the later steps.
+          Add-Content -Path $env:GITHUB_PATH -Value $bin
+          & (Join-Path -Path $bin -ChildPath 'kind') version
+          & (Join-Path -Path $bin -ChildPath 'helm') version
+          kubectl version --client
+
+      # Argo CD clones this public repository from GitHub at the commit under test, so a pass proves
+      # that the change's own manifests deploy. On a PR that is the head commit the author pushed,
+      # not the merge commit the checkout uses. Both values come in through env, never pasted into the script.
+      - name: 'Platform: Start-Platform.ps1 at the commit under test'
+        id: platform
+        env:
+          REPO_URL: https://github.com/${{ github.repository }}.git
+          REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          ./scripts/Start-Platform.ps1 -RepoUrl $env:REPO_URL -Revision $env:REVISION -TimeoutSeconds 900
+          if ($LASTEXITCODE -ne 0) {
+              Write-Output "::error::Start-Platform.ps1 failed: the platform did not come up at $($env:REVISION)."
+              exit 1
+          }
+
+      - name: 'Smoke: boutique-dev'
+        run: |
+          ./scripts/Test-Smoke.ps1 -Environment dev
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Smoke tests failed in boutique-dev.'; exit 1 }
+
+      # Runs even when dev failed, so one run shows both environments.
+      - name: 'Smoke: boutique-prod'
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' }}
+        run: |
+          ./scripts/Test-Smoke.ps1 -Environment prod
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Smoke tests failed in boutique-prod.'; exit 1 }
+
+      # Only after a failure: what Argo CD and the pods were doing, for the run's log.
+      # It never changes the result; the failure is already recorded.
+      - name: 'Diagnostics: cluster state'
+        if: ${{ failure() }}
+        continue-on-error: true
+        run: |
+          $context = $env:KUBE_CONTEXT
+          Write-Output '::group::Argo CD Applications'
+          kubectl --context $context get applications.argoproj.io --all-namespaces
+          # Sync errors and health messages are in each Application's status.
+          kubectl --context $context describe applications.argoproj.io --namespace argocd
+          Write-Output '::endgroup::'
+
+          Write-Output '::group::Pods'
+          kubectl --context $context get pods --all-namespaces --output wide
+          Write-Output '::endgroup::'
+
+          Write-Output '::group::Recent events'
+          kubectl --context $context get events --all-namespaces --sort-by=.metadata.creationTimestamp | Select-Object -Last 60
+          Write-Output '::endgroup::'
+
+          # Not Running and Ready: Pending and Failed pods, and crash-looping ones, which are still phase Running.
+          $pods = kubectl --context $context get pods --all-namespaces --output json | Out-String | ConvertFrom-Json
+          $notReady = @($pods.items | Where-Object {
+                  $_.status.phase -ne 'Succeeded' -and (
+                      $_.status.phase -ne 'Running' -or @($_.status.containerStatuses | Where-Object { -not $_.ready }).Count -gt 0)
+              })
+          if ($notReady.Count -eq 0) { Write-Output 'Every pod is Running and Ready.' }
+          foreach ($pod in $notReady) {
+              Write-Output "::group::Pod $($pod.metadata.namespace)/$($pod.metadata.name) ($($pod.status.phase))"
+              kubectl --context $context describe pod $pod.metadata.name --namespace $pod.metadata.namespace
+              kubectl --context $context logs $pod.metadata.name --namespace $pod.metadata.namespace --all-containers --tail=50
+              Write-Output '::endgroup::'
+          }
+
+      # No clean-up step: a GitHub-hosted runner is a fresh machine for every run.

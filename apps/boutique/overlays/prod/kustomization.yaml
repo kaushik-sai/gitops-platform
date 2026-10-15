@@ -1,0 +1,14 @@
+# Prod: Online Boutique in boutique-prod, with the upstream load generator as steady "user" traffic.
+# One replica per service: both environments share one laptop (DECISIONS #3).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: boutique-prod
+
+resources:
+  - ../../base
+
+labels:
+  - pairs:
+      environment: prod
+    includeSelectors: false
