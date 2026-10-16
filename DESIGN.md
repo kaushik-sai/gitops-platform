@@ -67,7 +67,34 @@ Environments are **overlays on one branch**, not branches:
 3. Merge to `main`. Every change to prod goes through a PR like this.
 4. Every cluster that tracks `main` (the laptop by default) picks up the commit and syncs both Applications.
 
-In Phase 1, dev and prod run the same upstream images, so a change to the base reaches both environments with the same commit. The difference between environments is only what the overlays say. Phase 2 adds real promotion: a new frontend image goes to dev first, and a separate PR bumps the image in the prod overlay.
+A change to the base reaches both environments with the same commit. The difference between environments is only what the overlays say. The frontend image is the exception: it reaches dev first and prod later, each with its own PR (next section).
+
+### Frontend images: release and promotion (Phase 2)
+
+The frontend is built here from `src/frontend/` (decision 17). Every other service keeps its upstream image. Each overlay pins the frontend in one `images` entry, so dev and prod can run different builds:
+
+```mermaid
+flowchart LR
+    pr["PR changing src/frontend<br/>ci: go test, image build"] -->|merge| rel["release workflow on main<br/>push to GHCR, Syft SBOM,<br/>cosign sign and attest, verify"]
+    rel -->|"opens PR: dev overlay to the new digest"| devpr["dev PR<br/>ci: validate, e2e"]
+    devpr -->|merge| dev["Argo CD syncs boutique-dev"]
+    dev -.->|"someone runs promote"| pro["promote workflow<br/>cosign verify dev's image"]
+    pro -->|"opens PR: prod overlay to the same digest"| prodpr["prod PR<br/>ci: validate, e2e"]
+    prodpr -->|merge| prod["Argo CD syncs boutique-prod"]
+```
+
+| Step | Who | What changes in Git |
+|---|---|---|
+| 1. Change the frontend | a person, PR | `src/frontend/`. `ci` runs the Go tests and builds the image; nothing is pushed |
+| 2. Release | `release` workflow, on the merge to `main` | Nothing yet. It pushes `ghcr.io/kaushik-sai/gitops-platform/frontend:sha-<commit>`, writes the SBOM, signs the image and attests the SBOM, verifies both while logged out, then opens the dev PR |
+| 3. Deploy to dev | a person merges the dev PR | `apps/boutique/overlays/dev/kustomization.yaml`: the frontend entry's `newName` and `digest` |
+| 4. Promote | a person runs the `promote` workflow | Nothing yet. It reads dev's digest from `main`, verifies its signature and SBOM attestation, then opens the prod PR |
+| 5. Deploy to prod | a person merges the prod PR | `apps/boutique/overlays/prod/kustomization.yaml`: the same two lines, with dev's digest |
+
+- **Only `main` releases.** The signing certificate names the workflow file and the branch. `cosign verify` here requires `release.yml@refs/heads/main` of this repository, so an image built from a branch or a fork fails verification (decision 22).
+- **The bot's PRs get the same checks.** A PR opened with `GITHUB_TOKEN` starts no `pull_request` runs, so each workflow also dispatches `ci` on its branch. `validate` and `e2e` then appear on the PR's head commit, and the `e2e` job deploys the new digest to a fresh kind cluster before anyone merges (decision 24).
+- **Until the first release** both overlays run the upstream `frontend:v0.10.7`. The PR that adds Phase 2 changes `src/frontend/`, so merging it starts the first release.
+- `scripts/Set-FrontendImage.ps1` makes the overlay change in steps 3 and 5. It accepts only `repository@sha256:<digest>` and rewrites only the frontend entry. `-Show` prints what an environment runs.
 
 Why not a branch per environment: branches drift and merges between them conflict. With overlays, the difference between dev and prod is one directory diff on one branch.
 
@@ -117,13 +144,15 @@ What this means:
 
 ## What changes in a real setup
 
-| Here (Phase 1) | Real setup |
+| Here | Real setup |
 |---|---|
 | One kind cluster; dev and prod are namespaces | Separate clusters per environment, in separate accounts or subscriptions, so a dev mistake cannot reach prod |
 | Argo CD with one replica of each component, installed by a script | HA Argo CD (several repo servers, a sharded application controller, Redis HA), managing itself or run from a management cluster |
 | Anonymous read-only UI; `admin` for break-glass | SSO (OIDC, for example Microsoft Entra ID) with RBAC by group; the local `admin` account disabled |
 | Public repository, no credentials; Argo CD polls Git | Private repository with read-only credentials (for example a GitHub App); a webhook so syncs start on push |
-| Upstream images from Google's public registry, by tag | Images built by the team, scanned, signed, stored in its own registry (ACR or GHCR) and deployed by digest |
+| The frontend built here, signed and deployed by digest; the other services are upstream images by tag | Every image built by the team, scanned for vulnerabilities from its SBOM, signed, stored in its own registry (ACR or GHCR) and deployed by digest |
+| Signatures verified by the promote workflow only | Verified at admission too, so the cluster refuses an unsigned image (Kyverno, Phase 5) |
+| A person runs `promote` | Promotion after dev passes automated checks or a soak time, still as a PR with an approval |
 | Port-forwards on 127.0.0.1 | Gateway API ingress with TLS and DNS; private cluster API and private networking |
 | 1 replica per service | 2 or more replicas, PodDisruptionBudgets, autoscaling |
 | Default AppProject (any repository, any destination), no NetworkPolicies | AppProjects per team and environment, NetworkPolicies, admission policy (Phase 5) |
@@ -143,6 +172,11 @@ CI downloads kind, Helm and kubeconform at these versions and checks each downlo
 | Online Boutique | v0.10.7 | vendored file; service images by tag `v0.10.7` |
 | `busybox` (load generator init container) | 1.38.0 | digest, set by upstream |
 | `redis` | `alpine` | a moving tag, set by upstream. A known gap, for the Phase 5 image policy |
+| Frontend build image | `golang:1.27.0-alpine` | digest, set by upstream in `src/frontend/Dockerfile` |
+| Frontend runtime image | `gcr.io/distroless/static` | digest, added here in `src/frontend/Dockerfile` |
+| Frontend image | built here | digest in each overlay, set by the release and promote PRs |
+| cosign | v3.1.3 | tool version, SHA-256 checked, in `release.yml` and `promote.yml` |
+| Syft | v1.54.1 | tool version, SHA-256 checked, in `release.yml` |
 
 ## Smoke test
 
@@ -170,20 +204,30 @@ Workflow `ci`, on `ubuntu-latest` GitHub-hosted runners. It runs on every PR to 
 
 | Job | Steps |
 |---|---|
-| `validate` | PSScriptAnalyzer (Error and Warning fail); Pester, with totals on the run's summary page and the NUnit file kept as an artifact; kubeconform `-strict` on every overlay and on the rendered root chart, against the Kubernetes 1.37.0 schemas. The Application schema comes from the CRDs-catalog at a pinned commit. A kind with no schema fails the check |
+| `validate` | PSScriptAnalyzer (Error and Warning fail); Pester, with totals on the run's summary page and the NUnit file kept as an artifact; the frontend's Go tests (the Dockerfile's `test` stage) and image build, with nothing pushed; kubeconform `-strict` on every overlay and on the rendered root chart, against the Kubernetes 1.37.0 schemas. The Application schema comes from the CRDs-catalog at a pinned commit. A kind with no schema fails the check |
 | `e2e` (needs `validate`) | A kind cluster on the runner; `Start-Platform.ps1` with `-Revision` set to the commit under test, which Argo CD fetches from GitHub; `Test-Smoke.ps1` on dev, then on prod even if dev failed; on failure, diagnostics: Applications, pods, recent events, and `describe` and logs of every pod that is not ready |
 
 - **The commit under test.** On a PR it is the head commit the author pushed, not the merge commit that the checkout uses, because Argo CD can only fetch commits that exist on GitHub. On `main` it is the pushed commit.
 - **Pinned tools.** kind 0.33.0, Helm 4.3.0 and kubeconform 0.8.0 are downloaded from their official releases and checked against the SHA-256 published with each. Pester 5.9.1 and PSScriptAnalyzer 1.25.0 are installed by exact version from the PowerShell Gallery. kubectl is the one preinstalled on the runner image; its version is printed in the log.
 - **Hardening.** A read-only token (`permissions: contents: read`), actions pinned to full commit SHAs, `persist-credentials: false`, and the repository URL and revision passed through `env`, never pasted into a script.
+- **Dispatched runs.** `ci` also runs when the release and promote workflows dispatch it on their PR branches (decision 24). The commit under test is then the branch's head, which is the PR's head commit.
 
-## Known gaps in Phase 1
+Two more workflows publish and promote the frontend (see [Frontend images](#frontend-images-release-and-promotion-phase-2)). Only their one job gets write access, and only what it uses:
+
+| Workflow | Runs | Token permissions |
+|---|---|---|
+| `release` | on a push to `main` that changes `src/frontend/`, or by hand on `main` | `contents: write` (branch), `pull-requests: write`, `packages: write` (GHCR), `id-token: write` (keyless signing), `actions: write` (dispatch `ci`) |
+| `promote` | by hand on `main` | `contents: write`, `pull-requests: write`, `actions: write` |
+
+## Known gaps
 
 | Gap | Planned in |
 |---|---|
 | Argo CD is not managed by Argo CD | Phase 5 |
 | Default AppProject; no NetworkPolicies; no admission policy | Phase 5 |
-| Images are upstream and not signed by this repo; `redis:alpine` is a moving tag | Phase 2 (frontend), Phase 5 (policy) |
+| Only the frontend is built and signed here; the other images are upstream, and `redis:alpine` is a moving tag | Phase 5 (policy; decide whether to rebuild, mirror or exempt them) |
+| Signatures are checked by the promote workflow, not by the cluster | Phase 5 (Kyverno) |
+| The SBOM is produced but not scanned for vulnerabilities | not planned yet |
 | No metrics, logs, traces or alerts | Phase 3 |
 | No ingress; access by port-forward only | Phase 3 |
 | No resource requests for Argo CD | not planned yet; measure first |
@@ -191,11 +235,11 @@ Workflow `ci`, on `ubuntu-latest` GitHub-hosted runners. It runs on every PR to 
 
 ## Roadmap
 
-### Phase 1: Foundation (this phase)
+### Phase 1: Foundation (done)
 
 The local cluster, Argo CD, the app of apps, Online Boutique in dev and prod, the scripts with Pester tests, and CI with an end-to-end deploy on every PR.
 
-### Phase 2: Build and supply chain
+### Phase 2: Build and supply chain (this phase)
 
 - Build the frontend from source, with a `FAIL_RATE` switch that makes a share of requests fail. Phase 4 uses it as the bad release.
 - SBOM with Syft.
