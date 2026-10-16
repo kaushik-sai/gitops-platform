@@ -86,28 +86,28 @@ Describe 'Get-FrontendImage' {
     }
 }
 
-Describe 'Set-FrontendImageLine' {
+Describe 'Edit-FrontendImageLine' {
     It 'replaces only the entry fields, keeping the comment and the rest of the file' {
         $before = Get-OverlayLine
-        $after = Set-FrontendImageLine -Lines $before -Reference "$script:Ghcr@$script:Digest"
+        $after = Edit-FrontendImageLine -Lines $before -Reference "$script:Ghcr@$script:Digest"
         $expected = Get-OverlayLine -Fields @("    newName: $script:Ghcr", "    digest: $script:Digest")
         $after | Should -Be $expected
     }
 
     It 'replaces an earlier digest' {
         $before = Get-OverlayLine -Fields @("    newName: $script:Ghcr", "    digest: $script:Digest")
-        $after = Set-FrontendImageLine -Lines $before -Reference "$script:Ghcr@$script:OtherDigest"
+        $after = Edit-FrontendImageLine -Lines $before -Reference "$script:Ghcr@$script:OtherDigest"
         (Get-FrontendImage -Lines $after).Reference | Should -Be "$script:Ghcr@$script:OtherDigest"
         $after.Count | Should -Be $before.Count
     }
 
     It 'adds the fields to an entry that has none' {
-        $after = Set-FrontendImageLine -Lines (Get-OverlayLine -Fields @()) -Reference "$script:Ghcr@$script:Digest"
+        $after = Edit-FrontendImageLine -Lines (Get-OverlayLine -Fields @()) -Reference "$script:Ghcr@$script:Digest"
         (Get-FrontendImage -Lines $after).Reference | Should -Be "$script:Ghcr@$script:Digest"
     }
 
     It 'throws and changes nothing for a reference without a digest' {
-        { Set-FrontendImageLine -Lines (Get-OverlayLine) -Reference "$script:Ghcr`:latest" } | Should -Throw '*pinned by digest*'
+        { Edit-FrontendImageLine -Lines (Get-OverlayLine) -Reference "$script:Ghcr`:latest" } | Should -Throw '*pinned by digest*'
     }
 }
 

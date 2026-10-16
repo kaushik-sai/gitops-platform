@@ -1,0 +1,122 @@
+# promote: opens the PR that takes dev's frontend image to prod. Started by hand, when dev looks good.
+#   1. Read the image the dev overlay pins on main: what boutique-dev runs.
+#   2. Verify its signature and SBOM attestation: signed by the release workflow on main, nothing else.
+#   3. A PR that sets the prod overlay to the same digest, and a ci run on it. Merging deploys to prod.
+#   The prod change is a one-entry diff that someone reviews and merges.
+
+name: promote
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: promote
+  cancel-in-progress: false
+
+env:
+  COSIGN_VERSION: '3.1.3'
+  SIGNER: https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/heads/main
+  OIDC_ISSUER: https://token.actions.githubusercontent.com
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  promote:
+    name: promote
+    # Promotes what main says dev runs, never a branch.
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write       # push the promotion branch
+      pull-requests: write  # open the PR
+      actions: write        # start ci on the promotion branch (DECISIONS #24)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Tools: pinned cosign'
+        run: |
+          # Downloads a release file and the checksum file published with it; stops unless they match.
+          function Save-VerifiedFile {
+              param([string] $Uri, [string] $ChecksumUri, [string] $Path)
+              $name = ([uri] $Uri).Segments[-1]
+              $sums = "$Path.sha256"
+              Invoke-WebRequest -Uri $Uri -OutFile $Path
+              Invoke-WebRequest -Uri $ChecksumUri -OutFile $sums
+              $line = Get-Content -Path $sums | Where-Object { $_ -match "^[0-9a-f]{64}\s+$([regex]::Escape($name))$" } | Select-Object -First 1
+              if (-not $line) { Write-Output "::error::No checksum for $name in $ChecksumUri."; exit 1 }
+              $expected = ($line -split '\s+')[0]
+              $actual = (Get-FileHash -Path $Path -Algorithm SHA256).Hash
+              if ($actual -ne $expected) { Write-Output "::error::Checksum mismatch for $name."; exit 1 }
+          }
+
+          $bin = Join-Path -Path $env:RUNNER_TEMP -ChildPath 'bin'
+          New-Item -ItemType Directory -Path $bin -Force | Out-Null
+          $base = "https://github.com/sigstore/cosign/releases/download/v$($env:COSIGN_VERSION)"
+          $download = Join-Path -Path $env:RUNNER_TEMP -ChildPath 'cosign-linux-amd64'
+          Save-VerifiedFile -Uri "$base/cosign-linux-amd64" -ChecksumUri "$base/cosign_checksums.txt" -Path $download
+          Move-Item -Path $download -Destination (Join-Path -Path $bin -ChildPath 'cosign')
+          chmod +x (Join-Path -Path $bin -ChildPath 'cosign')
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Add-Content -Path $env:GITHUB_PATH -Value $bin
+          & (Join-Path -Path $bin -ChildPath 'cosign') version
+
+      - name: "Read dev's image"
+        id: dev
+        run: |
+          $ref = ./scripts/Set-FrontendImage.ps1 -Environment dev -Show
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::dev does not pin a frontend image yet; merge a release PR first.'; exit 1 }
+          Write-Output "dev runs $ref"
+          "ref=$ref" | Add-Content -Path $env:GITHUB_OUTPUT
+
+      # Only an image this repository's release workflow signed on main reaches prod.
+      - name: 'Verify: signature and SBOM attestation'
+        env:
+          REF: ${{ steps.dev.outputs.ref }}
+        run: |
+          cosign verify --certificate-identity $env:SIGNER --certificate-oidc-issuer $env:OIDC_ISSUER $env:REF | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error::$($env:REF) is not signed by $($env:SIGNER)."; exit 1 }
+          cosign verify-attestation --type spdxjson --certificate-identity $env:SIGNER --certificate-oidc-issuer $env:OIDC_ISSUER $env:REF | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error::$($env:REF) has no SBOM attestation from $($env:SIGNER)."; exit 1 }
+          Write-Output "Verified: signed and attested by $($env:SIGNER)"
+
+      - name: 'Promote to prod: open the PR'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ steps.dev.outputs.ref }}
+        run: |
+          ./scripts/Set-FrontendImage.ps1 -Environment prod -FromEnvironment dev
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          git diff --quiet
+          if ($LASTEXITCODE -eq 0) { Write-Output 'prod already runs the same image as dev; no PR.'; exit 0 }
+
+          $short = ($env:REF -split '@sha256:')[-1].Substring(0, 12)
+          $branch = "promote/frontend-$short"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch --create $branch
+          git commit --all --quiet --message "Promote frontend $short from dev to prod" --message "Image: $($env:REF)"
+          gh auth setup-git
+          git push --quiet origin $branch
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+          $body = @(
+              'Takes the frontend that **dev** runs to **prod**.'
+              ''
+              "- Image: ``$($env:REF)``"
+              "- Signature and SBOM attestation verified: signed by ``$($env:SIGNER)``"
+              ''
+              'After merging, Argo CD deploys it to boutique-prod.'
+          ) -join "`n"
+          $url = gh pr create --base main --head $branch --title "Promote frontend $short from dev to prod" --body $body
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          gh workflow run ci.yml --ref $branch
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          "### Promotion`n`n- Image: ``$($env:REF)```n- Prod PR: $url" | Add-Content -Path $env:GITHUB_STEP_SUMMARY

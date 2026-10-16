@@ -33,7 +33,7 @@
 .EXAMPLE
     pwsh ./scripts/Set-FrontendImage.ps1 -Environment prod -FromEnvironment dev
 #>
-[CmdletBinding(SupportsShouldProcess, DefaultParameterSetName = 'Show')]
+[CmdletBinding(DefaultParameterSetName = 'Show')]
 param(
     [Parameter(Mandatory)]
     [ValidateSet('dev', 'prod')]
@@ -122,7 +122,7 @@ function Get-FrontendImage {
 
 # Returns the lines with the frontend entry's fields replaced by newName and digest.
 # Everything else, comments included, stays as it was.
-function Set-FrontendImageLine {
+function Edit-FrontendImageLine {
     [CmdletBinding()]
     [OutputType([string[]])]
     param(
@@ -171,7 +171,7 @@ if ($MyInvocation.InvocationName -ne '.') {
         $path = Get-OverlayFile -RepoRoot $RepoRoot -Environment $Environment
         $lines = Read-Overlay -Path $path
         $current = Get-FrontendImage -Lines $lines
-        if ($PSCmdlet.ParameterSetName -eq 'Show') {
+        if ($Show -or $PSCmdlet.ParameterSetName -eq 'Show') {
             if (-not $current.Reference) {
                 throw "The $Environment frontend is not pinned by digest yet (newName '$($current.NewName)', newTag '$($current.NewTag)')."
             }
@@ -191,7 +191,7 @@ if ($MyInvocation.InvocationName -ne '.') {
             Write-Information "$Environment frontend is already $reference."
             exit 0
         }
-        Write-Overlay -Path $path -Lines (Set-FrontendImageLine -Lines $lines -Reference $reference)
+        Write-Overlay -Path $path -Lines (Edit-FrontendImageLine -Lines $lines -Reference $reference)
         $name = if ($current.NewName) { $current.NewName } else { $script:FrontendUpstreamImage }
         $was = if ($current.Reference) { $current.Reference } else { "${name}:$($current.NewTag)" }
         Write-Information "$Environment frontend: $was -> $reference"
