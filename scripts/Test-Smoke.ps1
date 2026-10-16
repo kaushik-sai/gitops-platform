@@ -10,6 +10,8 @@
       /product/OLJCESPC7Z    product page (catalog, currency, recommendations, ads)
       /cart                  cart (cart service and Redis, plus shipping, currency, recommendations)
     Prints PASS or FAIL per check. Exits 1 if any check fails. Always stops the port-forward.
+    Stops with an error when the local port is already taken or the port-forward stops, so the
+    checks never reach something else listening on that port.
 
 .PARAMETER Environment
     dev or prod: tests the namespace boutique-<Environment>.
@@ -52,6 +54,30 @@ function Get-SmokeCheck {
     [pscustomobject] @{ Path = '/cart'; Expect = 'Shopping Cart' }
 }
 
+# Where kubectl port-forward writes its output: <path>.out and <path>.err.
+function Get-PortForwardLogPath {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory)] [string] $Namespace)
+    Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "port-forward-$Namespace"
+}
+
+# True when nothing listens on 127.0.0.1:<Port>, so the port-forward can take it.
+function Test-LocalPortFree {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter(Mandatory)] [int] $Port)
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
+    try {
+        $listener.Start()
+        $true
+    } catch [System.Net.Sockets.SocketException] {
+        $false
+    } finally {
+        $listener.Stop()
+    }
+}
+
 # Starts kubectl port-forward in the background and returns its process.
 function Open-PortForward {
     [CmdletBinding()]
@@ -61,10 +87,26 @@ function Open-PortForward {
         [Parameter(Mandatory)] [string] $Namespace,
         [Parameter(Mandatory)] [int] $LocalPort
     )
-    $log = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "port-forward-$Namespace"
+    $log = Get-PortForwardLogPath -Namespace $Namespace
     Start-Process -FilePath 'kubectl' -PassThru -NoNewWindow `
         -ArgumentList @('--context', $Context, '--namespace', $Namespace, 'port-forward', 'svc/frontend', "$($LocalPort):80") `
         -RedirectStandardOutput "$log.out" -RedirectStandardError "$log.err"
+}
+
+# Throws, with kubectl's error output, when the port-forward has stopped. Whatever answers on
+# the port then is not the frontend in this namespace.
+function Assert-PortForward {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [System.Diagnostics.Process] $Process,
+        [Parameter(Mandatory)] [string] $Namespace
+    )
+    if (-not $Process.HasExited) {
+        return
+    }
+    $errorLog = "$(Get-PortForwardLogPath -Namespace $Namespace).err"
+    $detail = if (Test-Path -LiteralPath $errorLog) { "$(Get-Content -LiteralPath $errorLog -Raw)".Trim() }
+    throw "kubectl port-forward for $Namespace stopped (exit $($Process.ExitCode)): $detail"
 }
 
 function Close-PortForward {
@@ -81,7 +123,8 @@ function Invoke-Probe {
     [OutputType([pscustomobject])]
     param([Parameter(Mandatory)] [string] $Uri)
     try {
-        $response = Invoke-WebRequest -Uri $Uri -TimeoutSec 10 -SkipHttpErrorCheck -ErrorAction Stop
+        # -NoProxy: a proxy from HTTP_PROXY cannot reach this machine's 127.0.0.1.
+        $response = Invoke-WebRequest -Uri $Uri -TimeoutSec 10 -SkipHttpErrorCheck -NoProxy -ErrorAction Stop
         [pscustomobject] @{ StatusCode = [int] $response.StatusCode; Content = [string] $response.Content }
     } catch {
         $null
@@ -98,14 +141,17 @@ function Wait-Frontend {
         [ValidateRange(1, 60)] [int] $IntervalSeconds = 2
     )
     $attempts = [math]::Max(1, [math]::Ceiling($TimeoutSeconds / $IntervalSeconds))
+    # The attempts cap the probes; the clock stops them too, because a probe can take up to 10 s.
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
     for ($attempt = 1; $attempt -le $attempts; $attempt++) {
         $probe = Invoke-Probe -Uri "$BaseUrl/_healthz"
         if ($probe -and $probe.StatusCode -eq 200) {
             return $true
         }
-        if ($attempt -lt $attempts) {
-            Start-Sleep -Seconds $IntervalSeconds
+        if ($attempt -ge $attempts -or $clock.Elapsed.TotalSeconds + $IntervalSeconds -gt $TimeoutSeconds) {
+            break
         }
+        Start-Sleep -Seconds $IntervalSeconds
     }
     $false
 }
@@ -135,7 +181,7 @@ function Invoke-SmokeCheck {
 }
 
 # Opens the port-forward, runs the checks and always closes it. Returns the results;
-# throws when the frontend never answers.
+# throws when the port is taken, the port-forward stops or the frontend never answers.
 function Test-Environment {
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -146,13 +192,22 @@ function Test-Environment {
         [Parameter(Mandatory)] [int] $TimeoutSeconds
     )
     $baseUrl = "http://127.0.0.1:$LocalPort"
+    # Something already on the port would answer the checks in place of the frontend.
+    if (-not (Test-LocalPortFree -Port $LocalPort)) {
+        throw "Port $LocalPort on 127.0.0.1 is already in use. Stop what uses it, or pass -LocalPort with a free port."
+    }
     $process = $null
     try {
         $process = Open-PortForward -Context $Context -Namespace $Namespace -LocalPort $LocalPort
-        if (-not (Wait-Frontend -BaseUrl $baseUrl -TimeoutSeconds $TimeoutSeconds)) {
+        $ready = Wait-Frontend -BaseUrl $baseUrl -TimeoutSeconds $TimeoutSeconds
+        # Checked after the wait too: a port-forward that failed may only exit after the port answered.
+        Assert-PortForward -Process $process -Namespace $Namespace
+        if (-not $ready) {
             throw "The frontend in $Namespace did not answer /_healthz within $TimeoutSeconds s."
         }
-        Invoke-SmokeCheck -BaseUrl $baseUrl
+        $results = @(Invoke-SmokeCheck -BaseUrl $baseUrl)
+        Assert-PortForward -Process $process -Namespace $Namespace
+        $results
     } finally {
         Close-PortForward -Process $process
     }

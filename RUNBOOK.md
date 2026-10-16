@@ -28,6 +28,7 @@ Every command names the context, so it never acts on another cluster.
 
 ```powershell
 docker info --format '{{.OSType}} {{.NCPU}} CPUs {{.MemTotal}} bytes'   # expect "linux"; 7.6 GiB shows as about 8160000000 bytes
+docker info --format '{{.CgroupVersion}}'                               # expect 2
 kind get clusters
 docker ps -a --filter name=gitops-local-control-plane
 ```
@@ -38,6 +39,7 @@ docker ps -a --filter name=gitops-local-control-plane
 | Docker Desktop in Windows containers mode (`OSType` is `windows`) | Switch to Linux containers, run again |
 | Too little memory for Docker | WSL 2 backend: set `memory=` under `[wsl2]` in `%UserProfile%\.wslconfig`, run `wsl --shutdown`, restart Docker Desktop. Hyper-V backend: Settings > Resources > Advanced. About 7.6 GiB is what this was built with |
 | The node container exists but is stopped (for example after Docker Desktop restarted) | `docker start gitops-local-control-plane`, then run `Start-Platform.ps1` again. If it still fails, reset (below) |
+| Docker runs cgroup v1 (`CgroupVersion` is `1`); `kind create cluster` fails during `kubeadm init`, and the kubelet log says `kubelet is configured to not run on a host using cgroup v1` | The pinned node image runs the kubelet with `failCgroupV1: true`, so it needs cgroup v2. Docker Desktop on WSL 2 uses it by default; on Linux, boot with the unified cgroup hierarchy (cgroup v2) |
 | A cluster was half created | Reset (below) |
 | `helm upgrade --install argocd` failed or timed out (10 min) | `kubectl --context kind-gitops-local -n argocd get pods`. Usually image pulls or memory: see those sections. Then run `Start-Platform.ps1` again; it upgrades in place |
 

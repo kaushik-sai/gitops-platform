@@ -178,16 +178,20 @@ jobs:
 
       # The root chart renders Argo CD Applications. Their schema comes from the CRDs-catalog at the
       # pinned commit; 'default' still serves the built-in kinds. Missing schemas fail here too.
+      # Rendered with the default revision and with one that looks like a number (an all-digit
+      # short SHA), which must still render as a string.
       - name: 'Manifests: root chart (helm template, kubeconform)'
         run: |
           $crdSchemas = "https://raw.githubusercontent.com/datreeio/CRDs-catalog/$($env:CRDS_CATALOG_SHA)/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json"
-          Write-Output '--- clusters/local ---'
-          $rendered = helm template root clusters/local
-          if ($LASTEXITCODE -ne 0) { Write-Output '::error::helm template clusters/local failed.'; exit 1 }
-          $rendered | kubeconform -strict -summary -kubernetes-version $env:KUBERNETES_VERSION -schema-location default -schema-location $crdSchemas -
-          if ($LASTEXITCODE -ne 0) {
-              Write-Output '::error::kubeconform: clusters/local rendered invalid resources or resources with no schema.'
-              exit 1
+          foreach ($revision in 'main', '1234567') {
+              Write-Output "--- clusters/local, targetRevision $revision ---"
+              $rendered = helm template root clusters/local --set-string "targetRevision=$revision"
+              if ($LASTEXITCODE -ne 0) { Write-Output '::error::helm template clusters/local failed.'; exit 1 }
+              $rendered | kubeconform -strict -summary -kubernetes-version $env:KUBERNETES_VERSION -schema-location default -schema-location $crdSchemas -
+              if ($LASTEXITCODE -ne 0) {
+                  Write-Output "::error::kubeconform: clusters/local rendered invalid resources or resources with no schema (targetRevision $revision)."
+                  exit 1
+              }
           }
 
   e2e:

@@ -36,6 +36,19 @@ BeforeAll {
         }
         @{ apiVersion = 'v1'; kind = 'List'; items = $items } | ConvertTo-Json -Depth 10
     }
+
+    # One Application as kubectl prints it, with the revision in its spec and the one Argo CD last compared.
+    function ConvertTo-RevisionItem {
+        param([string] $Name, [string] $Revision, [string] $ComparedTo, [string] $RepoUrl = 'https://example.com/repo.git')
+        @{
+            metadata = @{ name = $Name }
+            spec     = @{ source = @{ repoURL = $RepoUrl; targetRevision = $Revision } }
+            status   = @{
+                sync   = @{ status = 'Synced'; comparedTo = @{ source = @{ repoURL = $RepoUrl; targetRevision = $ComparedTo } } }
+                health = @{ status = 'Healthy' }
+            }
+        }
+    }
 }
 
 # lib/Cli.ps1 is shared by every script; its tests live here, with its main user.
@@ -323,6 +336,15 @@ Describe 'ConvertFrom-ApplicationList' {
         $row.Health | Should -Be 'Unknown'
     }
 
+    It 'reads the source in the spec and the source Argo CD last compared' {
+        $json = @{ items = @(ConvertTo-RevisionItem -Name 'boutique-dev' -Revision 'feature/x' -ComparedTo 'main') } | ConvertTo-Json -Depth 10
+        $row = ConvertFrom-ApplicationList -Json $json
+        $row.RepoUrl | Should -Be 'https://example.com/repo.git'
+        $row.Revision | Should -Be 'feature/x'
+        $row.ComparedRepoUrl | Should -Be 'https://example.com/repo.git'
+        $row.ComparedTo | Should -Be 'main'
+    }
+
     It 'returns nothing for an empty list' {
         @(ConvertFrom-ApplicationList -Json (ConvertTo-ApplicationListJson)).Count | Should -Be 0
     }
@@ -349,6 +371,43 @@ Describe 'Test-PlatformReady' {
     ) {
         $status = @(Get-ApplicationRow -Spec 'root=Synced/Healthy', 'boutique-dev=Synced/Healthy', "boutique-prod=$Sync/$Health")
         Test-PlatformReady -Status $status | Should -BeFalse
+    }
+
+    It 'is false while an Application still reports its status for the previous revision' {
+        # A re-run with a new -Revision: the spec changed, the status has not caught up yet.
+        $json = @{ items = @(
+                ConvertTo-RevisionItem -Name 'root' -Revision 'feature/x' -ComparedTo 'feature/x'
+                ConvertTo-RevisionItem -Name 'boutique-dev' -Revision 'feature/x' -ComparedTo 'main'
+            ) } | ConvertTo-Json -Depth 10
+        $status = @(ConvertFrom-ApplicationList -Json $json)
+        Test-PlatformReady -Status $status -RepoUrl 'https://example.com/repo.git' -Revision 'feature/x' | Should -BeFalse
+    }
+
+    It 'is false while a child Application still points at the previous revision' {
+        # The root has synced, but has not rewritten the child's spec yet.
+        $json = @{ items = @(
+                ConvertTo-RevisionItem -Name 'root' -Revision 'feature/x' -ComparedTo 'feature/x'
+                ConvertTo-RevisionItem -Name 'boutique-dev' -Revision 'main' -ComparedTo 'main'
+            ) } | ConvertTo-Json -Depth 10
+        Test-PlatformReady -Status @(ConvertFrom-ApplicationList -Json $json) -Revision 'feature/x' | Should -BeFalse
+    }
+
+    It 'is false when an Application deploys from another repository' {
+        $json = @{ items = @(
+                ConvertTo-RevisionItem -Name 'root' -Revision 'main' -ComparedTo 'main'
+                ConvertTo-RevisionItem -Name 'boutique-dev' -Revision 'main' -ComparedTo 'main' -RepoUrl 'https://example.com/fork.git'
+            ) } | ConvertTo-Json -Depth 10
+        Test-PlatformReady -Status @(ConvertFrom-ApplicationList -Json $json) -RepoUrl 'https://example.com/repo.git' -Revision 'main' |
+            Should -BeFalse
+    }
+
+    It 'is true when every Application points at and was compared against the repository and revision' {
+        $json = @{ items = @(
+                ConvertTo-RevisionItem -Name 'root' -Revision 'feature/x' -ComparedTo 'feature/x'
+                ConvertTo-RevisionItem -Name 'boutique-dev' -Revision 'feature/x' -ComparedTo 'feature/x'
+            ) } | ConvertTo-Json -Depth 10
+        Test-PlatformReady -Status @(ConvertFrom-ApplicationList -Json $json) -RepoUrl 'https://example.com/repo.git' -Revision 'feature/x' |
+            Should -BeTrue
     }
 
     It 'is true when two or more Applications are all Synced and Healthy' {
@@ -432,6 +491,30 @@ Describe 'Wait-PlatformReady' {
         Should -Invoke Invoke-Cli -Times $Polls -Exactly
         # No sleep after the last poll: it would only delay the error.
         Should -Invoke Start-Sleep -Times ($Polls - 1) -Exactly
+    }
+
+    It 'keeps polling while the status is for the previous revision, with -Revision' {
+        $stale = @{ items = @(
+                ConvertTo-RevisionItem -Name 'root' -Revision 'feature/x' -ComparedTo 'main'
+                ConvertTo-RevisionItem -Name 'boutique-dev' -Revision 'main' -ComparedTo 'main'
+            ) } | ConvertTo-Json -Depth 10
+        $current = @{ items = @(
+                ConvertTo-RevisionItem -Name 'root' -Revision 'feature/x' -ComparedTo 'feature/x'
+                ConvertTo-RevisionItem -Name 'boutique-dev' -Revision 'feature/x' -ComparedTo 'feature/x'
+            ) } | ConvertTo-Json -Depth 10
+        $script:responses = @((Get-FakeResult -Output $stale), (Get-FakeResult -Output $current))
+        $status = @(Wait-PlatformReady -Context 'kind-test' -TimeoutSeconds 60 -IntervalSeconds 10 -Revision 'feature/x' -InformationAction Ignore)
+        $status.ComparedTo | Should -Be @('feature/x', 'feature/x')
+        Should -Invoke Invoke-Cli -Times 2 -Exactly
+    }
+
+    It 'stops at the timeout even when each poll is slow' {
+        # Each kubectl call takes 1.1 s. ceil(3 / 1) = 3 polls would take longer than 3 s,
+        # so the clock stops it after the second.
+        $script:responses = @($script:notReady)
+        Mock Invoke-Cli { [System.Threading.Thread]::Sleep(1100); $script:notReady }
+        { Wait-PlatformReady -Context 'kind-test' -TimeoutSeconds 3 -IntervalSeconds 1 -InformationAction Ignore } | Should -Throw 'Timed out after 3 s*'
+        Should -Invoke Invoke-Cli -Times 2 -Exactly
     }
 
     It 'prints the table only when it changes' {
