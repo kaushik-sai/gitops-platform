@@ -163,6 +163,12 @@ func main() {
 	r.HandleFunc(baseUrl+"/bot", svc.chatBotHandler).Methods(http.MethodPost)
 
 	var handler http.Handler = r
+	// gitops-platform: fail a share of requests when FAIL_RATE is set (failrate.go).
+	handler, failRate, err := newFailRateHandler(os.Getenv("FAIL_RATE"), baseUrl+"/_healthz", handler)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Infof("FAIL_RATE: %v", failRate)
 	handler = &logHandler{log: log, next: handler}     // add logging
 	handler = ensureSessionID(handler)                 // add session ID
 	handler = otelhttp.NewHandler(handler, "frontend") // add OTel tracing

@@ -29,7 +29,13 @@ COPY . .
 ARG SKAFFOLD_GO_GCFLAGS
 RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} CGO_ENABLED=0 go build -ldflags="-s -w" -gcflags="${SKAFFOLD_GO_GCFLAGS}" -o /go/bin/frontend .
 
-FROM gcr.io/distroless/static
+# gitops-platform: runs the Go tests with the same Go image as the build. CI builds this
+# stage with --target test; a normal build skips it.
+FROM builder AS test
+RUN CGO_ENABLED=0 go test ./...
+
+# gitops-platform: pinned by digest (the latest tag on 2026-10-16), so every build uses the same base.
+FROM gcr.io/distroless/static:latest@sha256:58133991db06659feaabe0f4e97a35cebf15ef4ea08f8a4c6d2ee5f75e4aa6a0
 WORKDIR /src
 COPY --from=builder /go/bin/frontend /src/server
 COPY ./templates ./templates
