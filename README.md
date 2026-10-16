@@ -146,7 +146,7 @@ cosign verify-attestation --type spdxjson --certificate-identity https://github.
 
 One-time setup in the repository settings, both needed by the workflows above:
 - Settings, Actions, General: allow GitHub Actions to create and approve pull requests. Without it `gh pr create` fails with a permissions error.
-- After the first release, the `frontend` package on the repository page: Package settings, Change visibility, Public. kind pulls without credentials; the release run stops with this instruction until the package is public.
+- After the first release, the `gitops-platform/frontend` package on the repository page: Package settings, Change visibility, Public. kind pulls without credentials; the release run stops with this instruction until the package is public.
 
 ## Lint and tests
 

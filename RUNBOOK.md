@@ -146,7 +146,7 @@ docker exec gitops-local-control-plane crictl pull <image>                     #
 | No internet, DNS or proxy problem | Fix the network. The kubelet retries with a back-off; to retry now, delete the pod and its Deployment creates a new one: `kubectl --context kind-gitops-local -n boutique-dev delete pod <pod>` |
 | Docker Hub rate limit (`toomanyrequests`) | Anonymous pulls are limited per IP address. Wait, then delete the pod to retry |
 | Wrong image name or tag after a change in Git | Fix it in Git. `describe pod` shows the exact image the kubelet tried |
-| The frontend from GHCR: `401 Unauthorized` or `denied` | The package is private. Make it public: the `frontend` package on the repository page, Package settings, Change visibility |
+| The frontend from GHCR: `401 Unauthorized` or `denied` | The package is private. Make it public: the `gitops-platform/frontend` package on the repository page, Package settings, Change visibility |
 
 ## Smoke test fails
 
@@ -167,7 +167,7 @@ The `release` and `promote` workflows run on GitHub, not on the laptop. Open the
 | Error | Cause | Fix |
 |---|---|---|
 | `gh pr create`: `GitHub Actions is not permitted to create or approve pull requests` | The repository setting is off | Settings, Actions, General, Workflow permissions: allow GitHub Actions to create and approve pull requests. Then re-run the failed job |
-| `The image cannot be pulled without logging in` | First release: GHCR made the new package private | Make the `frontend` package public, then run `release` again by hand (Actions, release, Run workflow). It builds and pushes again; the earlier push is left unused |
+| `The image cannot be pulled without logging in` | First release: GHCR made the new package private | Make the `gitops-platform/frontend` package public, then run `release` again by hand (Actions, release, Run workflow). It builds and pushes again; the earlier push is left unused |
 | `No checksum for ...` or `Checksum mismatch` | A tool download did not match its release's published SHA-256 | Do not work around it. Re-run once in case the download broke; if it still fails, check the release page of that version |
 | `cosign verify failed` in `release` | The signature was made but cannot be verified as `release.yml@refs/heads/main` | Check that the run was on `main`; the job skips other branches. A fork's workflow has a different identity by design |
 | `is not signed by ...` in `promote` | dev pins an image that this repository's release workflow on `main` did not sign | Find which PR changed the dev overlay (`git log -p apps/boutique/overlays/dev/kustomization.yaml`). Revert it, or release from `main` |

@@ -156,7 +156,9 @@ jobs:
           docker logout ghcr.io | Out-Null
           docker buildx imagetools inspect $env:REF | Out-Null
           if ($LASTEXITCODE -ne 0) {
-              $package = "https://github.com/$($env:GITHUB_REPOSITORY)/pkgs/container/$($env:IMAGE.Split('/')[-1])"
+              # The package is named after the image path under the owner: gitops-platform/frontend.
+              $name = $env:IMAGE -replace '^ghcr\.io/[^/]+/', ''
+              $package = "https://github.com/$($env:GITHUB_REPOSITORY)/pkgs/container/$([uri]::EscapeDataString($name))"
               Write-Output "::error::The image cannot be pulled without logging in. Make the package public once ($package, Package settings, Change visibility), then run this workflow again."
               exit 1
           }
