@@ -46,9 +46,16 @@ Describe 'Remove-KindCluster' {
         Should -Invoke Invoke-Cli -Times 0 -Exactly -ParameterFilter { $Arguments[0] -eq 'delete' }
     }
 
-    It 'deletes nothing with -WhatIf' {
-        Remove-KindCluster -ClusterName 'gitops-local' -WhatIf | Out-Null
+    It 'deletes nothing with -WhatIf and returns Skipped' {
+        Remove-KindCluster -ClusterName 'gitops-local' -WhatIf | Should -Be 'Skipped'
         Should -Invoke Invoke-Cli -Times 0 -Exactly -ParameterFilter { $Arguments[0] -eq 'delete' }
+    }
+
+    It 'takes -WhatIf and -Confirm on the script itself' {
+        $scriptPath = Join-Path -Path $PSScriptRoot -ChildPath '..' -AdditionalChildPath 'scripts', 'Stop-Platform.ps1'
+        $parameters = (Get-Command -Name $scriptPath).Parameters
+        $parameters.ContainsKey('WhatIf') | Should -BeTrue
+        $parameters.ContainsKey('Confirm') | Should -BeTrue
     }
 }
 

@@ -34,6 +34,46 @@ Describe 'Open-PortForward' {
     }
 }
 
+Describe 'Test-LocalPortFree' {
+    It 'is true for a port nothing listens on' {
+        # Port 0 asks the OS for a free port; release it again and test that one.
+        $probe = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+        $probe.Start()
+        $port = $probe.LocalEndpoint.Port
+        $probe.Stop()
+        Test-LocalPortFree -Port $port | Should -BeTrue
+    }
+
+    It 'is false while something listens on the port' {
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+        $listener.Start()
+        try {
+            Test-LocalPortFree -Port $listener.LocalEndpoint.Port | Should -BeFalse
+        } finally {
+            $listener.Stop()
+        }
+    }
+}
+
+Describe 'Assert-PortForward' {
+    BeforeEach {
+        Mock Get-PortForwardLogPath { Join-Path -Path $TestDrive -ChildPath 'port-forward-boutique-dev' }
+    }
+
+    It 'does nothing while the process runs' {
+        { Assert-PortForward -Process (Get-Process -Id $PID) -Namespace 'boutique-dev' } | Should -Not -Throw
+    }
+
+    It 'throws with the exit code and kubectl''s error output once the process has stopped' {
+        Set-Content -Path (Join-Path -Path $TestDrive -ChildPath 'port-forward-boutique-dev.err') -Value 'unable to listen on any of the requested ports'
+        $pwsh = (Get-Process -Id $PID).Path
+        $stopped = Start-Process -FilePath $pwsh -ArgumentList '-NoProfile', '-NonInteractive', '-Command', 'exit 3' -PassThru -NoNewWindow
+        $stopped.WaitForExit()
+        { Assert-PortForward -Process $stopped -Namespace 'boutique-dev' } |
+            Should -Throw '*port-forward for boutique-dev stopped (exit 3): unable to listen on any of the requested ports*'
+    }
+}
+
 Describe 'Close-PortForward' {
     It 'does nothing when there is no process' {
         Mock Stop-Process { }
@@ -52,6 +92,13 @@ Describe 'Invoke-Probe' {
         Should -Invoke Invoke-WebRequest -Times 1 -Exactly -ParameterFilter {
             $Uri -eq 'http://127.0.0.1:18080/_healthz' -and $SkipHttpErrorCheck
         }
+    }
+
+    It 'never goes through a proxy' {
+        # A proxy from HTTP_PROXY cannot reach this machine's 127.0.0.1.
+        Mock Invoke-WebRequest { [pscustomobject] @{ StatusCode = 200; Content = 'ok' } }
+        Invoke-Probe -Uri 'http://127.0.0.1:18080/_healthz' | Out-Null
+        Should -Invoke Invoke-WebRequest -Times 1 -Exactly -ParameterFilter { $NoProxy }
     }
 
     It 'returns $null when nothing answers' {
@@ -87,6 +134,14 @@ Describe 'Wait-Frontend' {
         # ceil(9 / 2) = 5 attempts, with a sleep between each, none after the last.
         Should -Invoke Invoke-Probe -Times 5 -Exactly
         Should -Invoke Start-Sleep -Times 4 -Exactly
+    }
+
+    It 'stops at the timeout even when each probe is slow' {
+        # Each probe takes 1.1 s. ceil(3 / 1) = 3 probes would take longer than 3 s,
+        # so the clock stops it after the second.
+        Mock Invoke-Probe { [System.Threading.Thread]::Sleep(1100); $null }
+        Wait-Frontend -BaseUrl 'http://127.0.0.1:18080' -TimeoutSeconds 3 -IntervalSeconds 1 | Should -BeFalse
+        Should -Invoke Invoke-Probe -Times 2 -Exactly
     }
 }
 
@@ -135,7 +190,9 @@ Describe 'Test-Environment' {
         # An unstarted process object stands in for kubectl: Close-PortForward is mocked,
         # so nothing is ever stopped.
         $script:process = [System.Diagnostics.Process]::new()
+        Mock Test-LocalPortFree { $true }
         Mock Open-PortForward { $script:process }
+        Mock Assert-PortForward { }
         Mock Close-PortForward { }
         Mock Start-Sleep { }
         Mock Invoke-Probe { Get-FakeResponse }
@@ -149,6 +206,29 @@ Describe 'Test-Environment' {
             $Context -eq 'kind-test' -and $Namespace -eq 'boutique-dev' -and $LocalPort -eq 18080
         }
         Should -Invoke Invoke-Probe -Times 1 -Exactly -ParameterFilter { $Uri -eq 'http://127.0.0.1:18080/cart' }
+        Should -Invoke Close-PortForward -Times 1 -Exactly -ParameterFilter { $Process -eq $script:process }
+    }
+
+    It 'checks that the port-forward still runs, before and after the page checks' {
+        Test-Environment -Context 'kind-test' -Namespace 'boutique-dev' -LocalPort 18080 -TimeoutSeconds 30 | Out-Null
+        Should -Invoke Assert-PortForward -Times 2 -Exactly -ParameterFilter { $Process -eq $script:process -and $Namespace -eq 'boutique-dev' }
+    }
+
+    It 'throws before starting a port-forward when the local port is already in use' {
+        # Whatever holds the port would answer the checks in place of the frontend.
+        Mock Test-LocalPortFree { $false }
+        { Test-Environment -Context 'kind-test' -Namespace 'boutique-dev' -LocalPort 18080 -TimeoutSeconds 30 } |
+            Should -Throw '*Port 18080 on 127.0.0.1 is already in use*'
+        Should -Invoke Open-PortForward -Times 0 -Exactly
+        Should -Invoke Invoke-Probe -Times 0 -Exactly
+    }
+
+    It 'throws, runs no page checks and closes the port-forward when it has stopped' {
+        # Something answers /_healthz, but it is not this port-forward.
+        Mock Assert-PortForward { throw 'kubectl port-forward for boutique-dev stopped (exit 1): error' }
+        { Test-Environment -Context 'kind-test' -Namespace 'boutique-dev' -LocalPort 18080 -TimeoutSeconds 30 } |
+            Should -Throw '*port-forward for boutique-dev stopped*'
+        Should -Invoke Invoke-Probe -Times 0 -Exactly -ParameterFilter { $Uri -notlike '*/_healthz' }
         Should -Invoke Close-PortForward -Times 1 -Exactly -ParameterFilter { $Process -eq $script:process }
     }
 

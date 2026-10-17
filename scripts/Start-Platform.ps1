@@ -186,23 +186,44 @@ function ConvertFrom-ApplicationList {
         if ($null -eq $item) { continue }
         $sync = Get-NestedValue -InputObject $item -Path 'status', 'sync', 'status'
         $health = Get-NestedValue -InputObject $item -Path 'status', 'health', 'status'
+        # Sync and health describe the source in comparedTo. Right after the spec changes they
+        # still describe the old source, until Argo CD has fetched and compared the new one.
         [pscustomobject] @{
-            Name   = $item.metadata.name
-            Sync   = if ($sync) { $sync } else { 'Unknown' }
-            Health = if ($health) { $health } else { 'Unknown' }
+            Name            = $item.metadata.name
+            Sync            = if ($sync) { $sync } else { 'Unknown' }
+            Health          = if ($health) { $health } else { 'Unknown' }
+            RepoUrl         = Get-NestedValue -InputObject $item -Path 'spec', 'source', 'repoURL'
+            Revision        = Get-NestedValue -InputObject $item -Path 'spec', 'source', 'targetRevision'
+            ComparedRepoUrl = Get-NestedValue -InputObject $item -Path 'status', 'sync', 'comparedTo', 'source', 'repoURL'
+            ComparedTo      = Get-NestedValue -InputObject $item -Path 'status', 'sync', 'comparedTo', 'source', 'targetRevision'
         }
     }
 }
 
 # Ready when there is more than the root (its children exist) and every Application is Synced and Healthy.
+# With -RepoUrl and -Revision, every Application must also point at them and have been compared
+# against them: on a re-run, the old status says Synced and Healthy for the previous revision.
 function Test-PlatformReady {
     [CmdletBinding()]
     [OutputType([bool])]
-    param([Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Status)
+    param(
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Status,
+        [string] $RepoUrl,
+        [string] $Revision
+    )
     if ($Status.Count -lt 2) {
         return $false
     }
-    -not ($Status | Where-Object { $_.Sync -ne 'Synced' -or $_.Health -ne 'Healthy' })
+    if ($Status | Where-Object { $_.Sync -ne 'Synced' -or $_.Health -ne 'Healthy' }) {
+        return $false
+    }
+    if ($RepoUrl -and ($Status | Where-Object { $_.RepoUrl -ne $RepoUrl -or $_.ComparedRepoUrl -ne $RepoUrl })) {
+        return $false
+    }
+    if ($Revision -and ($Status | Where-Object { $_.Revision -ne $Revision -or $_.ComparedTo -ne $Revision })) {
+        return $false
+    }
+    $true
 }
 
 function Format-ApplicationStatus {
@@ -212,20 +233,24 @@ function Format-ApplicationStatus {
     if ($Status.Count -eq 0) {
         return '(no Applications yet)'
     }
-    ($Status | Sort-Object Name | Format-Table Name, Sync, Health -AutoSize | Out-String).Trim()
+    ($Status | Sort-Object Name | Format-Table Name, Sync, Health, ComparedTo -AutoSize | Out-String).Trim()
 }
 
-# Polls the Applications until all are Synced and Healthy. Prints the table when it changes.
-# Throws with the last table when the time is up.
+# Polls the Applications until all are Synced and Healthy (at -RepoUrl and -Revision when given).
+# Prints the table when it changes. Throws with the last table when the time is up.
 function Wait-PlatformReady {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)] [string] $Context,
         [Parameter(Mandatory)] [int] $TimeoutSeconds,
-        [ValidateRange(1, 300)] [int] $IntervalSeconds = 10
+        [ValidateRange(1, 300)] [int] $IntervalSeconds = 10,
+        [string] $RepoUrl,
+        [string] $Revision
     )
     Write-Information "Waiting up to $TimeoutSeconds s for every Application to be Synced and Healthy..."
     $attempts = [math]::Max(1, [math]::Ceiling($TimeoutSeconds / $IntervalSeconds))
+    # The attempts cap the polls; the clock stops them too, because each kubectl call takes time.
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
     $table = ''
     for ($attempt = 1; $attempt -le $attempts; $attempt++) {
         $result = Invoke-Cli -Name kubectl -Arguments @('--context', $Context, 'get', 'applications.argoproj.io',
@@ -236,12 +261,13 @@ function Wait-PlatformReady {
             Write-Information $current
             $table = $current
         }
-        if (Test-PlatformReady -Status $status) {
+        if (Test-PlatformReady -Status $status -RepoUrl $RepoUrl -Revision $Revision) {
             return $status
         }
-        if ($attempt -lt $attempts) {
-            Start-Sleep -Seconds $IntervalSeconds
+        if ($attempt -ge $attempts -or $clock.Elapsed.TotalSeconds + $IntervalSeconds -gt $TimeoutSeconds) {
+            break
         }
+        Start-Sleep -Seconds $IntervalSeconds
     }
     throw "Timed out after $TimeoutSeconds s waiting for every Application to be Synced and Healthy:$([Environment]::NewLine)$table"
 }
@@ -278,7 +304,7 @@ if ($MyInvocation.InvocationName -ne '.') {
         Write-Information "Handing the cluster to Git: $RepoUrl at '$Revision'"
         Install-RootApplication -Context $context -Application (Build-RootApplication -RepoUrl $RepoUrl -Revision $Revision)
         if (-not $NoWait) {
-            Wait-PlatformReady -Context $context -TimeoutSeconds $TimeoutSeconds | Out-Null
+            Wait-PlatformReady -Context $context -TimeoutSeconds $TimeoutSeconds -RepoUrl $RepoUrl -Revision $Revision | Out-Null
         }
     } catch {
         Write-Error $_.Exception.Message -ErrorAction Continue

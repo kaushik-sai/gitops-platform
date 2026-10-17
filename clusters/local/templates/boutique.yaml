@@ -11,8 +11,9 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: {{ $.Values.repoURL }}
-    targetRevision: {{ $.Values.targetRevision }}
+    # Quoted: a revision such as 1234567 (a short SHA) or 1.10 (a tag) would otherwise be a number.
+    repoURL: {{ $.Values.repoURL | quote }}
+    targetRevision: {{ $.Values.targetRevision | quote }}
     path: apps/boutique/overlays/{{ . }}
   destination:
     server: https://kubernetes.default.svc

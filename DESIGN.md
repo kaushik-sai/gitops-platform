@@ -23,7 +23,7 @@
 | 4 | Applications `boutique-dev`, `boutique-prod` | Argo CD, from the root | [clusters/local/templates/boutique.yaml](clusters/local/templates/boutique.yaml), one per entry in [values.yaml](clusters/local/values.yaml) |
 | 5 | Online Boutique in `boutique-dev`, `boutique-prod` | Argo CD, from each child | [apps/boutique/overlays/](apps/boutique/overlays/) on top of [apps/boutique/base/](apps/boutique/base/) |
 
-After step 3 the script only waits. Every 10 s it reads the Applications, until at least two exist (the root has created its children) and all are Synced and Healthy, or `-TimeoutSeconds` (default 900) runs out.
+After step 3 the script only waits. Every 10 s it reads the Applications, until at least two exist (the root has created its children) and all are Synced and Healthy, or `-TimeoutSeconds` (default 900) runs out. Each Application must also point at `-RepoUrl` and `-Revision`, and Argo CD must have compared it against them (`status.sync.comparedTo`). On a re-run with a new revision, the old status still says Synced and Healthy for a moment, so without this check the script could stop waiting too early.
 
 ### One revision for everything
 
@@ -189,7 +189,7 @@ CI downloads kind, Helm and kubeconform at these versions and checks each downlo
 | `/product/OLJCESPC7Z` | `Sunglasses` | a product page renders |
 | `/cart` | `Shopping Cart` | the cart page renders |
 
-To render these pages the frontend calls the product catalog, currency, ad, recommendation, cart (with Redis) and shipping services. Not covered: `checkoutservice`, `paymentservice` and `emailservice`. The frontend only calls them when an order is placed, and the smoke test only reads pages. The script always stops its port-forward, prints PASS or FAIL per check and exits 1 on any failure.
+To render these pages the frontend calls the product catalog, currency, ad, recommendation, cart (with Redis) and shipping services. Not covered: `checkoutservice`, `paymentservice` and `emailservice`. The frontend only calls them when an order is placed, and the smoke test only reads pages. The script always stops its port-forward, prints PASS or FAIL per check and exits 1 on any failure. It stops with an error, before any check, when the local port is already in use or the port-forward has stopped: otherwise whatever else listens on that port would answer the checks. Requests to 127.0.0.1 skip any proxy set in `HTTP_PROXY`.
 
 ## Scripts and tests
 

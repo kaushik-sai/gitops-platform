@@ -11,8 +11,11 @@
 
 .EXAMPLE
     pwsh ./scripts/Stop-Platform.ps1
+
+.EXAMPLE
+    pwsh ./scripts/Stop-Platform.ps1 -WhatIf
 #>
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess)]
 param(
     [ValidatePattern('^[a-z0-9][a-z0-9-]*$')]
     [string] $ClusterName = 'gitops-local'
@@ -21,7 +24,7 @@ param(
 Set-StrictMode -Version Latest
 . (Join-Path -Path $PSScriptRoot -ChildPath 'lib' -AdditionalChildPath 'Cli.ps1')
 
-# Returns 'Deleted' or 'NotFound'. Throws when kind fails.
+# Returns 'Deleted', 'NotFound', or 'Skipped' when -WhatIf or -Confirm declined it. Throws when kind fails.
 function Remove-KindCluster {
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([string])]
@@ -34,7 +37,7 @@ function Remove-KindCluster {
         return 'NotFound'
     }
     if (-not $PSCmdlet.ShouldProcess($ClusterName, 'Delete kind cluster')) {
-        return 'NotFound'
+        return 'Skipped'
     }
     $result = Invoke-Cli -Name kind -Arguments @('delete', 'cluster', '--name', $ClusterName) -Live
     if ($result.ExitCode -ne 0) {
@@ -57,10 +60,10 @@ if ($MyInvocation.InvocationName -ne '.') {
         Write-Error $_.Exception.Message -ErrorAction Continue
         exit 1
     }
-    if ($outcome -eq 'Deleted') {
-        Write-Information "Cluster '$ClusterName' deleted."
-    } else {
-        Write-Information "No cluster named '$ClusterName'; nothing to delete."
+    switch ($outcome) {
+        'Deleted' { Write-Information "Cluster '$ClusterName' deleted." }
+        'Skipped' { Write-Information "Cluster '$ClusterName' not deleted." }
+        default { Write-Information "No cluster named '$ClusterName'; nothing to delete." }
     }
     exit 0
 }
