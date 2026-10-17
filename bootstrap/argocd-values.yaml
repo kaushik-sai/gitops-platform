@@ -17,3 +17,10 @@ dex:
   enabled: false
 notifications:
   enabled: false
+
+# Argo CD's Redis from Google's Docker Hub mirror. The chart's default registry, ECR Public,
+# rate-limits GitHub-hosted runners (429 "Data limit exceeded"), which left argocd-redis in
+# ImagePullBackOff and failed e2e. Same image and tag; the mirror serves the same digest.
+redis:
+  image:
+    repository: mirror.gcr.io/library/redis
