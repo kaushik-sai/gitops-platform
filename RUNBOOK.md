@@ -130,7 +130,7 @@ Boutique requests 1112 Mi in dev and 1368 Mi in prod (budget in [DESIGN.md](DESI
 | The frontend, once released: `ghcr.io/kaushik-sai/gitops-platform/frontend@sha256:...` | GHCR; the package must be public |
 | `redis:alpine`, `busybox:1.38.0@sha256:...` | Docker Hub |
 | `kindest/node:v1.37.0@sha256:...` | Docker Hub (pulled by Docker on the host when the cluster is created) |
-| Argo CD images | as set by chart `argo-cd` 10.10.3 |
+| Argo CD images | as set by chart `argo-cd` 10.10.3, except Redis: `mirror.gcr.io/library/redis` (bootstrap/argocd-values.yaml), because ECR Public rate-limits CI runners |
 | The Argo CD chart | `oci://ghcr.io/argoproj/argo-helm/argo-cd` (pulled by Helm on the host) |
 
 **Check.**
