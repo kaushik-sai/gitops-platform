@@ -113,13 +113,20 @@ Describe 'Edit-FrontendImageLine' {
 
 Describe 'Set-FrontendImage.ps1 on a copy of the repository' {
     BeforeEach {
-        # The real overlays, copied, so the test also proves the script understands them.
+        # The real overlays, copied, so the test also proves the script understands them. Their
+        # frontend entry is reset to the upstream tag, so the tests start from the same state
+        # whatever main currently pins (a merged release PR pins dev, a promotion pins prod).
         $script:Root = Join-Path -Path $TestDrive -ChildPath ([guid]::NewGuid())
         foreach ($env in 'dev', 'prod') {
             $dir = Join-Path -Path $script:Root -ChildPath 'apps' -AdditionalChildPath 'boutique', 'overlays', $env
             New-Item -ItemType Directory -Path $dir -Force | Out-Null
             $source = Join-Path -Path $PSScriptRoot -ChildPath '..' -AdditionalChildPath 'apps', 'boutique', 'overlays', $env, 'kustomization.yaml'
-            Copy-Item -Path $source -Destination $dir
+            $lines = Read-Overlay -Path $source
+            $entry = Find-FrontendEntry -Lines $lines
+            $reset = @($lines[0..$entry.Start]) + "$($entry.FieldIndent)newTag: v0.10.7"
+            $after = if ($entry.Fields.Count -gt 0) { $entry.Fields[-1] + 1 } else { $entry.Start + 1 }
+            if ($after -lt $lines.Count) { $reset += $lines[$after..($lines.Count - 1)] }
+            Write-Overlay -Path (Join-Path -Path $dir -ChildPath 'kustomization.yaml') -Lines $reset
         }
         $script:Dev = Get-OverlayFile -RepoRoot $script:Root -Environment dev
         $script:Prod = Get-OverlayFile -RepoRoot $script:Root -Environment prod
