@@ -1,0 +1,219 @@
+# release: publishes the frontend built from src/frontend, then opens the PR that deploys it to dev.
+#   1. Build the image and push it to GHCR, tagged sha-<commit>.
+#   2. SBOM of the pushed image with Syft (SPDX JSON).
+#   3. cosign, keyless: sign the image and attach the SBOM as a signed attestation. The certificate
+#      comes from GitHub's OIDC token and names this workflow on main, so no key is stored anywhere.
+#   4. Verify both, as anyone can, and check that the image can be pulled without logging in.
+#   5. A PR that sets the dev overlay to the new digest, and a ci run on it. Merging deploys to dev.
+#   Prod follows later with the promote workflow.
+
+name: release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/frontend/**'
+  workflow_dispatch:
+
+# Only the job below gets write access, and only for what it does.
+permissions:
+  contents: read
+
+# One release at a time, and none is cancelled: each one pushes an image and opens a PR.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  COSIGN_VERSION: '3.1.3'
+  SYFT_VERSION: '1.54.1'
+  # GHCR needs a lower-case name; this repository's name already is.
+  IMAGE: ghcr.io/${{ github.repository }}/frontend
+  # What cosign verify expects: this workflow, run from main, with a token from GitHub Actions.
+  SIGNER: https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/heads/main
+  OIDC_ISSUER: https://token.actions.githubusercontent.com
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  release:
+    name: release
+    # A signature names the branch it came from; only main's count (see SIGNER).
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write       # push the release branch
+      pull-requests: write  # open the PR
+      packages: write       # push the image to GHCR
+      id-token: write       # GitHub's OIDC token, for keyless signing
+      actions: write        # start ci on the release branch (DECISIONS #24)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Tools: pinned cosign and Syft'
+        run: |
+          # Downloads a release file and the checksum file published with it; stops unless they match.
+          function Save-VerifiedFile {
+              param([string] $Uri, [string] $ChecksumUri, [string] $Path)
+              $name = ([uri] $Uri).Segments[-1]
+              $sums = "$Path.sha256"
+              Invoke-WebRequest -Uri $Uri -OutFile $Path
+              Invoke-WebRequest -Uri $ChecksumUri -OutFile $sums
+              $line = Get-Content -Path $sums | Where-Object { $_ -match "^[0-9a-f]{64}\s+$([regex]::Escape($name))$" } | Select-Object -First 1
+              if (-not $line) { Write-Output "::error::No checksum for $name in $ChecksumUri."; exit 1 }
+              $expected = ($line -split '\s+')[0]
+              $actual = (Get-FileHash -Path $Path -Algorithm SHA256).Hash
+              if ($actual -ne $expected) { Write-Output "::error::Checksum mismatch for $name."; exit 1 }
+          }
+
+          $bin = Join-Path -Path $env:RUNNER_TEMP -ChildPath 'bin'
+          New-Item -ItemType Directory -Path $bin -Force | Out-Null
+
+          $base = "https://github.com/sigstore/cosign/releases/download/v$($env:COSIGN_VERSION)"
+          $download = Join-Path -Path $env:RUNNER_TEMP -ChildPath 'cosign-linux-amd64'
+          Save-VerifiedFile -Uri "$base/cosign-linux-amd64" -ChecksumUri "$base/cosign_checksums.txt" -Path $download
+          Move-Item -Path $download -Destination (Join-Path -Path $bin -ChildPath 'cosign')
+          chmod +x (Join-Path -Path $bin -ChildPath 'cosign')
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+          $name = "syft_$($env:SYFT_VERSION)_linux_amd64.tar.gz"
+          $base = "https://github.com/anchore/syft/releases/download/v$($env:SYFT_VERSION)"
+          $archive = Join-Path -Path $env:RUNNER_TEMP -ChildPath $name
+          Save-VerifiedFile -Uri "$base/$name" -ChecksumUri "$base/syft_$($env:SYFT_VERSION)_checksums.txt" -Path $archive
+          tar -xzf $archive -C $bin syft
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+          Add-Content -Path $env:GITHUB_PATH -Value $bin
+          & (Join-Path -Path $bin -ChildPath 'cosign') version
+          & (Join-Path -Path $bin -ChildPath 'syft') version
+
+      - name: 'Registry: log in to GHCR'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $env:GH_TOKEN | docker login ghcr.io --username $env:GITHUB_ACTOR --password-stdin
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      # The source label links the package to this repository on GitHub. The digest is read back
+      # from the registry: that is what the overlay pins, the signature covers and the SBOM describes.
+      - name: 'Image: build and push'
+        id: image
+        run: |
+          $tag = "sha-$($env:GITHUB_SHA.Substring(0, 12))"
+          docker buildx build --push --provenance=false --sbom=false --progress plain `
+              --label "org.opencontainers.image.source=https://github.com/$($env:GITHUB_REPOSITORY)" `
+              --label "org.opencontainers.image.revision=$($env:GITHUB_SHA)" `
+              --label 'org.opencontainers.image.licenses=Apache-2.0' `
+              --tag "$($env:IMAGE):$tag" src/frontend
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::The image build or push failed.'; exit 1 }
+
+          $manifest = docker buildx imagetools inspect "$($env:IMAGE):$tag" --format '{{json .Manifest}}' | Out-String | ConvertFrom-Json
+          $digest = [string] $manifest.digest
+          if ($digest -notmatch '^sha256:[0-9a-f]{64}$') { Write-Output "::error::Unexpected digest '$digest'."; exit 1 }
+          $ref = "$($env:IMAGE)@$digest"
+          Write-Output "Pushed $($env:IMAGE):$tag as $ref"
+          "tag=$tag" | Add-Content -Path $env:GITHUB_OUTPUT
+          "ref=$ref" | Add-Content -Path $env:GITHUB_OUTPUT
+
+      - name: 'SBOM: Syft'
+        env:
+          REF: ${{ steps.image.outputs.ref }}
+        run: |
+          $sbom = Join-Path -Path $env:RUNNER_TEMP -ChildPath 'frontend.spdx.json'
+          syft scan "registry:$($env:REF)" --output "spdx-json=$sbom"
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Syft failed.'; exit 1 }
+          $packages = @((Get-Content -Path $sbom -Raw | ConvertFrom-Json).packages).Count
+          Write-Output "SBOM: $packages packages"
+
+      - name: 'SBOM: keep it with the run'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: frontend-sbom
+          path: ${{ runner.temp }}/frontend.spdx.json
+          if-no-files-found: error
+
+      - name: 'Sign: cosign keyless signature and SBOM attestation'
+        env:
+          REF: ${{ steps.image.outputs.ref }}
+        run: |
+          cosign sign --yes $env:REF
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::cosign sign failed.'; exit 1 }
+          cosign attest --yes --type spdxjson --predicate (Join-Path -Path $env:RUNNER_TEMP -ChildPath 'frontend.spdx.json') $env:REF
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::cosign attest failed.'; exit 1 }
+
+      # The same checks the promote workflow runs before prod, and that anyone can run. Logged out,
+      # so they also prove that the image and its signatures are public, as kind in ci needs.
+      - name: 'Verify: signature, attestation and anonymous pull'
+        env:
+          REF: ${{ steps.image.outputs.ref }}
+        run: |
+          docker logout ghcr.io | Out-Null
+          docker buildx imagetools inspect $env:REF | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+              # The package is named after the image path under the owner: gitops-platform/frontend.
+              $name = $env:IMAGE -replace '^ghcr\.io/[^/]+/', ''
+              $package = "https://github.com/$($env:GITHUB_REPOSITORY)/pkgs/container/$([uri]::EscapeDataString($name))"
+              Write-Output "::error::The image cannot be pulled without logging in. Make the package public once ($package, Package settings, Change visibility), then run this workflow again."
+              exit 1
+          }
+          cosign verify --certificate-identity $env:SIGNER --certificate-oidc-issuer $env:OIDC_ISSUER $env:REF | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::cosign verify failed.'; exit 1 }
+          cosign verify-attestation --type spdxjson --certificate-identity $env:SIGNER --certificate-oidc-issuer $env:OIDC_ISSUER $env:REF | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::cosign verify-attestation failed.'; exit 1 }
+          Write-Output "Verified: signed and attested by $($env:SIGNER)"
+
+      # PRs opened with GITHUB_TOKEN start no pull_request runs, so the required checks would never
+      # appear. A dispatch of ci on the branch reports them on the PR's head commit (DECISIONS #24).
+      - name: 'Deploy to dev: open the PR'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ steps.image.outputs.ref }}
+          TAG: ${{ steps.image.outputs.tag }}
+        run: |
+          $branch = "release/frontend-$($env:TAG)"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch --create $branch
+          ./scripts/Set-FrontendImage.ps1 -Environment dev -Image $env:REF
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          git diff --quiet
+          if ($LASTEXITCODE -eq 0) { Write-Output 'dev already runs this image; no PR.'; exit 0 }
+
+          git commit --all --quiet --message "Deploy frontend $($env:TAG) to dev" --message "Image: $($env:REF)"
+          gh auth setup-git
+          git push --quiet origin $branch
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+          $run = "$($env:GITHUB_SERVER_URL)/$($env:GITHUB_REPOSITORY)/actions/runs/$($env:GITHUB_RUN_ID)"
+          $body = @(
+              "Deploys the frontend built from $($env:GITHUB_SHA) to **dev**."
+              ''
+              "- Image: ``$($env:REF)``"
+              "- Built, signed and attested by [release run $($env:GITHUB_RUN_ID)]($run); the SBOM is attached to the run"
+              ''
+              'Verify it yourself:'
+              ''
+              '```'
+              "cosign verify --certificate-identity $($env:SIGNER) --certificate-oidc-issuer $($env:OIDC_ISSUER) $($env:REF)"
+              '```'
+              ''
+              'After merging, Argo CD deploys it to boutique-dev. To take it to prod, run the promote workflow.'
+          ) -join "`n"
+          $url = gh pr create --base main --head $branch --title "Deploy frontend $($env:TAG) to dev" --body $body
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          gh workflow run ci.yml --ref $branch
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+          @(
+              '### Frontend release'
+              ''
+              "- Image: ``$($env:REF)``"
+              "- Dev PR: $url"
+              '- SBOM: the `frontend-sbom` artifact of this run, also attached to the image as a signed attestation'
+          ) | Add-Content -Path $env:GITHUB_STEP_SUMMARY

@@ -1,4 +1,4 @@
-# RUNBOOK: local platform (Phase 1)
+# RUNBOOK: local platform
 
 Troubleshooting the kind cluster, Argo CD and Online Boutique on the laptop. Run the commands from the repo root in PowerShell 7. They use the default cluster `gitops-local`, so the context is `kind-gitops-local` and the node container is `gitops-local-control-plane`. With `-ClusterName <name>`, use `kind-<name>` and `<name>-control-plane`.
 
@@ -127,6 +127,7 @@ Boutique requests 1112 Mi in dev and 1368 Mi in prod (budget in [DESIGN.md](DESI
 | Image | Registry |
 |---|---|
 | Boutique services: `us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/<service>:v0.10.7` | Google Artifact Registry (public) |
+| The frontend, once released: `ghcr.io/kaushik-sai/gitops-platform/frontend@sha256:...` | GHCR; the package must be public |
 | `redis:alpine`, `busybox:1.38.0@sha256:...` | Docker Hub |
 | `kindest/node:v1.37.0@sha256:...` | Docker Hub (pulled by Docker on the host when the cluster is created) |
 | Argo CD images | as set by chart `argo-cd` 10.10.3 |
@@ -145,6 +146,7 @@ docker exec gitops-local-control-plane crictl pull <image>                     #
 | No internet, DNS or proxy problem | Fix the network. The kubelet retries with a back-off; to retry now, delete the pod and its Deployment creates a new one: `kubectl --context kind-gitops-local -n boutique-dev delete pod <pod>` |
 | Docker Hub rate limit (`toomanyrequests`) | Anonymous pulls are limited per IP address. Wait, then delete the pod to retry |
 | Wrong image name or tag after a change in Git | Fix it in Git. `describe pod` shows the exact image the kubelet tried |
+| The frontend from GHCR: `401 Unauthorized` or `denied` | The package is private. Make it public: the `gitops-platform/frontend` package on the repository page, Package settings, Change visibility |
 
 ## Smoke test fails
 
@@ -157,6 +159,22 @@ kubectl --context kind-gitops-local -n boutique-dev logs deploy/frontend --tail 
 Get-Content (Join-Path ([IO.Path]::GetTempPath()) 'port-forward-boutique-dev.err')    # the smoke test's port-forward errors
 pwsh ./scripts/Test-Smoke.ps1 -Environment dev -LocalPort 18090                         # if port 18080 is already in use
 ```
+
+## Release or promotion fails
+
+The `release` and `promote` workflows run on GitHub, not on the laptop. Open the failed run under Actions; each step ends with a `::error::` line that names the problem.
+
+| Error | Cause | Fix |
+|---|---|---|
+| `gh pr create`: `GitHub Actions is not permitted to create or approve pull requests` | The repository setting is off | Settings, Actions, General, Workflow permissions: allow GitHub Actions to create and approve pull requests. Then re-run the failed job |
+| `The image cannot be pulled without logging in` | First release: GHCR made the new package private | Make the `gitops-platform/frontend` package public, then run `release` again by hand (Actions, release, Run workflow). It builds and pushes again; the earlier push is left unused |
+| `No checksum for ...` or `Checksum mismatch` | A tool download did not match its release's published SHA-256 | Do not work around it. Re-run once in case the download broke; if it still fails, check the release page of that version |
+| `cosign verify failed` in `release` | The signature was made but cannot be verified as `release.yml@refs/heads/main` | Check that the run was on `main`; the job skips other branches. A fork's workflow has a different identity by design |
+| `is not signed by ...` in `promote` | dev pins an image that this repository's release workflow on `main` did not sign | Find which PR changed the dev overlay (`git log -p apps/boutique/overlays/dev/kustomization.yaml`). Revert it, or release from `main` |
+| `dev does not pin a frontend image yet` | No release PR has been merged | Merge the dev PR that `release` opened first |
+| The bot's PR shows no checks, or waits for `validate` and `e2e` | The `ci` dispatch did not run | Run it on the PR's branch: `gh workflow run ci.yml --ref <branch>`, or Actions, ci, Run workflow, pick the branch |
+
+To see what each environment runs: `pwsh ./scripts/Set-FrontendImage.ps1 -Environment dev -Show` (or `prod`).
 
 ## Reset everything
 

@@ -1,5 +1,6 @@
 # ci: the checks for every pull request and for main, on GitHub-hosted runners.
-#   validate: PSScriptAnalyzer, Pester, and a schema check of every manifest Argo CD applies.
+#   validate: PSScriptAnalyzer, Pester, the frontend's Go tests and image build, and a schema check
+#             of every manifest Argo CD applies.
 #   e2e:      the whole platform in a kind cluster. Start-Platform.ps1 installs Argo CD, Argo CD
 #             deploys the commit under test from GitHub, then Online Boutique is smoke-tested in
 #             dev and prod. It runs only when validate passes.
@@ -12,6 +13,8 @@ on:
   # Runs on main too, so the README badge shows the state of main.
   push:
     branches: [main]
+  # Also how the release and promote workflows run ci on the PRs they open: a PR opened with
+  # GITHUB_TOKEN starts no pull_request run, but a dispatch on its branch does (DECISIONS #24).
   workflow_dispatch:
 
 # Read-only token: nothing here writes to the repository.
@@ -154,6 +157,17 @@ jobs:
           name: pester-results
           path: ${{ runner.temp }}/pester.xml
           if-no-files-found: ignore
+
+      # The frontend from src/frontend: the Go tests in the Dockerfile's test stage, with the same Go
+      # image as the build, then the image itself. Nothing is pushed: the release workflow publishes
+      # from main (DECISIONS #18).
+      - name: 'Frontend: go test and image build'
+        working-directory: src/frontend
+        run: |
+          docker build --target test --progress plain .
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Frontend: go test failed.'; exit 1 }
+          docker build --progress plain --tag frontend:ci .
+          if ($LASTEXITCODE -ne 0) { Write-Output '::error::Frontend: the image build failed.'; exit 1 }
 
       # Every overlay, rendered the way Argo CD renders it. -strict rejects unknown fields, and a
       # kind with no schema is an error (no -ignore-missing-schemas), so nothing goes unchecked.

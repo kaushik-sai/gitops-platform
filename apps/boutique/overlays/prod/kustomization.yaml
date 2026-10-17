@@ -12,3 +12,10 @@ labels:
   - pairs:
       environment: prod
     includeSelectors: false
+
+images:
+  # The frontend. Until the first release it is the upstream image. Then the release workflow
+  # sets dev to the image built from src/frontend, and the promote workflow copies dev's image
+  # to prod. Both use scripts/Set-FrontendImage.ps1, which rewrites only this entry (DECISIONS #23).
+  - name: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/frontend
+    newTag: v0.10.7
