@@ -17,7 +17,8 @@ images:
   # sets dev to the image built from src/frontend, and the promote workflow copies dev's image
   # to prod. Both use scripts/Set-FrontendImage.ps1, which rewrites only this entry (DECISIONS #23).
   - name: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/frontend
-    newTag: v0.10.7
+    newName: ghcr.io/kaushik-sai/gitops-platform/frontend
+    digest: sha256:1bc18c11dc482a62c0297718bb4966d0a55d32aac6f35d3c1c6abc60d6f96582
 
 patches:
   # No load generator in dev: nothing reads dev's traffic, and it saves memory (DECISIONS #10).
